@@ -64,6 +64,8 @@ use std::{
     process::Command,
 };
 
+mod manifest;
+
 const PATCH_EXT: &str = "patch";
 
 #[derive(Parser, Debug)]
