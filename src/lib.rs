@@ -50,16 +50,18 @@
 //! git commit -m "fix broken-serde in serde"
 //! ```
 
-use anyhow::{Ok, Result, anyhow};
-use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
+use anyhow::{Ok, Result, anyhow, bail};
+use cargo_metadata::{Metadata, MetadataCommand};
 use clap::Parser;
 use fs_extra::dir::{CopyOptions, copy};
 use log::*;
+use serde::Deserialize;
 use std::{
     collections::HashSet,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 const PATCH_EXT: &str = "patch";
@@ -70,6 +72,141 @@ struct Cli {
     crates: Vec<String>,
     #[arg(short, long)]
     force: bool,
+}
+
+#[derive(Deserialize)]
+struct CargoLock {
+    #[serde(default)]
+    package: Vec<LockPkg>,
+}
+
+#[derive(Deserialize)]
+struct LockPkg {
+    name: String,
+    version: String,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+struct CrateRef {
+    name: String,
+    version: String,
+}
+
+impl CrateRef {
+    fn slug(&self) -> String {
+        format!("{}-{}", self.name, self.version)
+    }
+}
+
+fn load_metadata() -> Result<Metadata> {
+    MetadataCommand::new()
+        .no_deps()
+        .exec()
+        .map_err(|e| anyhow!("cargo metadata failed: {}", e))
+}
+
+fn load_lock(ws_root: &Path) -> Result<CargoLock> {
+    let path = ws_root.join("Cargo.lock");
+    let text = fs::read_to_string(&path)
+        .map_err(|e| anyhow!("failed to read {:?}: {}", path, e))?;
+    toml::from_str(&text).map_err(|e| anyhow!("failed to parse Cargo.lock: {}", e))
+}
+
+fn resolve_crate(lock: &CargoLock, spec: &str) -> Result<CrateRef> {
+    let (name, want_ver) = match spec.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (spec, None),
+    };
+    // Accept any lockfile entry by name. A [patch.crates-io] redirect rewrites the
+    // `source` field to None, so filtering on `registry+` drops the crate we want
+    // to compare against. `find_crate_src` handles non-registry crates by failing
+    // to locate them in the registry cache and reporting a clear error.
+    let matches: Vec<&LockPkg> = lock
+        .package
+        .iter()
+        .filter(|p| p.name == name && want_ver.is_none_or(|v| p.version == v))
+        .collect();
+    match matches.len() {
+        0 => Err(anyhow!("package `{}` not found in Cargo.lock", spec)),
+        1 => Ok(CrateRef {
+            name: matches[0].name.clone(),
+            version: matches[0].version.clone(),
+        }),
+        _ => Err(anyhow!(
+            "multiple versions of `{}` found; specify with name@version",
+            name
+        )),
+    }
+}
+
+fn find_crate_src(ws_root: &Path, cr: &CrateRef) -> Result<PathBuf> {
+    let registry = home::cargo_home()?.join("registry/src");
+    if registry.is_dir() {
+        for entry in fs::read_dir(&registry)? {
+            let p = entry?.path().join(cr.slug());
+            if p.is_dir() {
+                return Ok(p);
+            }
+        }
+    }
+    download_crate(ws_root, cr)
+}
+
+fn download_crate(ws_root: &Path, cr: &CrateRef) -> Result<PathBuf> {
+    let cache = ws_root.join("target/patch-download");
+    fs::create_dir_all(&cache)?;
+    let dst = cache.join(cr.slug());
+    if dst.is_dir() {
+        return Ok(dst);
+    }
+    let url = format!(
+        "https://crates.io/api/v1/crates/{}/{}/download",
+        cr.name, cr.version
+    );
+    info!("downloading {}", url);
+    let tar_path = cache.join(format!("{}.crate", cr.slug()));
+    let status = Command::new("curl")
+        .args(["-sSL", "-o"])
+        .arg(&tar_path)
+        .arg(&url)
+        .status()?;
+    if !status.success() {
+        bail!("curl failed for {}", url);
+    }
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(&cache)
+        .status()?;
+    if !status.success() {
+        bail!("tar failed for {:?}", tar_path);
+    }
+    let _ = fs::remove_file(&tar_path);
+    if !dst.is_dir() {
+        bail!("extracted archive did not produce {:?}", dst);
+    }
+    Ok(dst)
+}
+
+fn copy_crate(src: &Path, dst_folder: &Path, overwrite: bool) -> Result<PathBuf> {
+    fs::create_dir_all(dst_folder)?;
+    let slug = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("source folder has no name: {:?}", src))?;
+    let dst = dst_folder.join(slug);
+    if dst.exists() {
+        if overwrite {
+            info!("copy {} to {:?}", slug, dst_folder);
+            fs::remove_dir_all(&dst)?;
+        } else {
+            info!("skip {}, {:?} already exists.", slug, dst);
+            return Ok(dst);
+        }
+    }
+    copy(src, dst_folder, &CopyOptions::new())?;
+    Ok(dst)
 }
 
 fn patches_folder(md: &Metadata) -> PathBuf {
@@ -92,68 +229,8 @@ fn clean_patch_folder(md: &Metadata) -> Result<()> {
     Ok(())
 }
 
-fn pkg_root(pkg: &Package) -> &Path {
-    pkg.manifest_path
-        .parent()
-        .expect("manifest_path has parent")
-        .as_std_path()
-}
-
-fn pkg_slug(pkg: &Package) -> Result<&str> {
-    pkg_root(pkg)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Dependency Folder does not have a name"))
-}
-
-fn patch_target_path(pkg: &Package, md: &Metadata) -> Result<PathBuf> {
-    Ok(patch_target_folder(md).join(pkg_slug(pkg)?))
-}
-
-fn query<'a>(md: &'a Metadata, q: &str) -> Result<&'a Package> {
-    let (name, ver) = match q.split_once('@') {
-        Some((n, v)) => (n, Some(v)),
-        None => (q, None),
-    };
-    let matches: Vec<&Package> = md
-        .packages
-        .iter()
-        .filter(|p| p.name == name && ver.is_none_or(|v| p.version.to_string() == v))
-        .collect();
-    match matches.len() {
-        0 => Err(anyhow!("package `{}` not found", q)),
-        1 => Ok(matches[0]),
-        _ => Err(anyhow!(
-            "multiple versions of `{}` found; specify with name@version",
-            name
-        )),
-    }
-}
-
-fn copy_package(pkg: &Package, dst_folder: &Path, overwrite: bool) -> Result<PathBuf> {
-    fs::create_dir_all(dst_folder)?;
-    let dst = dst_folder.join(pkg_slug(pkg)?);
-    if dst.exists() {
-        if overwrite {
-            info!("crate: {}, copy to {:?}", pkg.name, dst_folder);
-            fs::remove_dir_all(&dst)?;
-        } else {
-            info!("crate: {}, skip, {:?} already exists.", pkg.name, &dst);
-            return Ok(dst);
-        }
-    }
-    copy(pkg_root(pkg), dst_folder, &CopyOptions::new())?;
-    Ok(dst)
-}
-
-fn load_metadata() -> Result<Metadata> {
-    MetadataCommand::new()
-        .exec()
-        .map_err(|e| anyhow!("cargo metadata failed: {}", e))
-}
-
-fn collect_patch_list(md: &Metadata) -> Result<HashSet<PackageId>> {
-    let mut list: HashSet<PackageId> = HashSet::new();
+fn collect_patch_list(md: &Metadata, lock: &CargoLock) -> Result<HashSet<CrateRef>> {
+    let mut list = HashSet::new();
     let mut values: Vec<&serde_json::Value> = Vec::new();
     if !md.workspace_metadata.is_null() {
         values.push(&md.workspace_metadata);
@@ -175,7 +252,7 @@ fn collect_patch_list(md: &Metadata) -> Result<HashSet<PackageId>> {
         };
         for c in crates {
             if let Some(n) = c.as_str() {
-                list.insert(query(md, n)?.id.clone());
+                list.insert(resolve_crate(lock, n)?);
             }
         }
     }
@@ -192,6 +269,8 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     let md = load_metadata()?;
+    let ws_root = md.workspace_root.as_std_path().to_path_buf();
+    let lock = load_lock(&ws_root)?;
 
     let patches_folder = patches_folder(&md);
     let patch_target_folder = patch_target_folder(&md);
@@ -204,10 +283,11 @@ pub fn run() -> anyhow::Result<()> {
         }
         for n in args.crates.iter() {
             info!("crate: {}, starting patch creation.", n);
-            let pkg = query(&md, n)?;
-            let patched_crate_path = patch_target_path(pkg, &md)?;
+            let cr = resolve_crate(&lock, n)?;
+            let src = find_crate_src(&ws_root, &cr)?;
+            let patched_crate_path = patch_target_folder.join(cr.slug());
 
-            let original_crate_path = copy_package(pkg, &patch_target_tmp_folder, true)?;
+            let original_crate_path = copy_crate(&src, &patch_target_tmp_folder, true)?;
             git::init(&original_crate_path)?;
 
             let original_crate_git_path = original_crate_path.join(".git");
@@ -221,7 +301,7 @@ pub fn run() -> anyhow::Result<()> {
             )?;
 
             let patch_file =
-                patches_folder.join(format!("{}+{}.{}", pkg.name, pkg.version, PATCH_EXT));
+                patches_folder.join(format!("{}+{}.{}", cr.name, cr.version, PATCH_EXT));
             git::create_patch(&patched_crate_path, &patch_file)?;
             fs::remove_dir_all(&patch_target_tmp_folder)?;
 
@@ -231,7 +311,7 @@ pub fn run() -> anyhow::Result<()> {
     } else {
         info!("applying patch");
 
-        let mut crates_to_patch = collect_patch_list(&md)?;
+        let mut crates_to_patch = collect_patch_list(&md, &lock)?;
 
         if args.force {
             info!("Cleaning up patch folder.");
@@ -251,18 +331,21 @@ pub fn run() -> anyhow::Result<()> {
                         .ok_or(anyhow!("Patch file does not have a name"))?;
 
                     if let Some((pkg_name, version)) = filename.split_once('+') {
-                        let pkg = query(&md, &format!("{}@{}", pkg_name, version))?;
-                        if !crates_to_patch.contains(&pkg.id) {
+                        let cr = CrateRef {
+                            name: pkg_name.to_string(),
+                            version: version.to_string(),
+                        };
+                        if !crates_to_patch.contains(&cr) {
                             warn!(
                                 "crate: {}, {} is not in the [package.metadata.patch] or [workspace.metadata.patch] section of Cargo.toml. Did you forget to add it?",
                                 pkg_name, pkg_name
                             );
                             continue;
                         }
-
-                        let target = patch_target_path(pkg, &md)?;
+                        let target = patch_target_folder.join(cr.slug());
                         if !target.exists() {
-                            copy_package(pkg, &patch_target_folder, args.force)?;
+                            let src = find_crate_src(&ws_root, &cr)?;
+                            copy_crate(&src, &patch_target_folder, args.force)?;
                             info!("crate: {}, applying patch started.", pkg_name);
                             git::init(&target)?;
                             git::apply(&target, &patch_file)?;
@@ -277,15 +360,14 @@ pub fn run() -> anyhow::Result<()> {
                                 pkg_name, target
                             );
                         }
-                        crates_to_patch.remove(&pkg.id);
+                        crates_to_patch.remove(&cr);
                     }
                 }
             }
         }
-        for pid in crates_to_patch {
-            if let Some(pkg) = md.packages.iter().find(|p| p.id == pid) {
-                copy_package(pkg, &patch_target_folder, args.force)?;
-            }
+        for cr in crates_to_patch {
+            let src = find_crate_src(&ws_root, &cr)?;
+            copy_crate(&src, &patch_target_folder, args.force)?;
         }
     }
 
