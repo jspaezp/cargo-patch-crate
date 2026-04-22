@@ -1,0 +1,15 @@
+[package]
+name = "roundtrip-fixture"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+home = "0.5"
+
+[package.metadata.patch]
+crates = ["home"]
+
+[patch.crates-io]
+home = { path = "./target/patch/home-0.5.12" }

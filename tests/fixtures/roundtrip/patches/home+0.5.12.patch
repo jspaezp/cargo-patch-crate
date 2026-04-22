@@ -1,0 +1,12 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index cc3e93a..6a7e936 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -148,3 +148,7 @@ pub fn rustup_home() -> io::Result<PathBuf> {
+ pub fn rustup_home_with_cwd(cwd: &Path) -> io::Result<PathBuf> {
+     env::rustup_home_with_cwd_env(&env::OS_ENV, cwd)
+ }
++
++pub fn i_was_patched_correctly() -> &'static str {
++    "i was patched correctly"
++}
