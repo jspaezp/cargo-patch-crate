@@ -1,0 +1,9 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 941212b..51f44e5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -439,3 +439,4 @@ mod read;
+ 
+ #[cfg(feature = "raw_value")]
+ mod raw;
++// fixture marker

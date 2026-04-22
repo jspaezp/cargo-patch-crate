@@ -1,0 +1,15 @@
+[package]
+name = "broken-patch-fixture"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+serde_json = "1"
+
+[package.metadata.patch]
+crates = ["serde_json"]
+
+[patch.crates-io]
+serde_json = { path = "./target/patch/serde_json-1.0.149" }
