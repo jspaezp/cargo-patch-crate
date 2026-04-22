@@ -45,6 +45,32 @@ fn reconcile_is_idempotent() {
     );
 }
 
+#[test]
+#[ignore = "runs nested cargo; network + slow"]
+fn end_to_end_cargo_run_prints_patched_string() {
+    let (_tmp, dir) = common::stage_fixture("roundtrip");
+    patch_crate::run_at(&dir, Cli::default()).expect("reconcile");
+
+    let out = std::process::Command::new("cargo")
+        .current_dir(&dir)
+        .args(["run", "--quiet"])
+        .output()
+        .expect("cargo run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "cargo run failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("i was patched correctly"),
+        "expected patched output, got:\n{}",
+        stdout
+    );
+}
+
 fn snapshot_dir(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     if !dir.is_dir() {
