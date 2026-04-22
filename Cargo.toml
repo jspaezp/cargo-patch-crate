@@ -26,6 +26,13 @@ path = "src/main.rs"
 # crates = ["clap", "fs_extra"]
 
 
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+panic = "abort"
+
 [dependencies]
 paris = { version = "1.5", features = ["macros"] }
 anyhow = "1"
