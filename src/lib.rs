@@ -51,7 +51,6 @@
 //! ```
 
 use anyhow::{Ok, Result, anyhow, bail};
-use cargo_metadata::{Metadata, MetadataCommand};
 use clap::Parser;
 use fs_extra::dir::{CopyOptions, copy};
 use log::*;
@@ -68,12 +67,12 @@ mod manifest;
 
 const PATCH_EXT: &str = "patch";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(author, version, about, long_about = None)]
-struct Cli {
-    crates: Vec<String>,
+pub struct Cli {
+    pub crates: Vec<String>,
     #[arg(short, long)]
-    force: bool,
+    pub force: bool,
 }
 
 #[derive(Deserialize)]
@@ -98,13 +97,6 @@ impl CrateRef {
     fn slug(&self) -> String {
         format!("{}-{}", self.name, self.version)
     }
-}
-
-fn load_metadata() -> Result<Metadata> {
-    MetadataCommand::new()
-        .no_deps()
-        .exec()
-        .map_err(|e| anyhow!("cargo metadata failed: {}", e))
 }
 
 fn load_lock(ws_root: &Path) -> Result<CargoLock> {
@@ -211,82 +203,54 @@ fn copy_crate(src: &Path, dst_folder: &Path, overwrite: bool) -> Result<PathBuf>
     Ok(dst)
 }
 
-fn patches_folder(md: &Metadata) -> PathBuf {
-    md.workspace_root.as_std_path().join("patches")
+fn patches_folder(ws_root: &Path) -> PathBuf {
+    ws_root.join("patches")
 }
 
-fn patch_target_folder(md: &Metadata) -> PathBuf {
-    md.workspace_root.as_std_path().join("target/patch")
+fn patch_target_folder(ws_root: &Path) -> PathBuf {
+    ws_root.join("target/patch")
 }
 
-fn patch_target_tmp_folder(md: &Metadata) -> PathBuf {
-    md.workspace_root.as_std_path().join("target/patch-tmp")
+fn patch_target_tmp_folder(ws_root: &Path) -> PathBuf {
+    ws_root.join("target/patch-tmp")
 }
 
-fn clean_patch_folder(md: &Metadata) -> Result<()> {
-    let p = patch_target_folder(md);
+fn clean_patch_folder(ws_root: &Path) -> Result<()> {
+    let p = patch_target_folder(ws_root);
     if p.exists() {
         fs::remove_dir_all(p)?;
     }
     Ok(())
 }
 
-fn collect_patch_list(md: &Metadata, lock: &CargoLock) -> Result<HashSet<CrateRef>> {
+fn resolve_patch_list(
+    patch_crate_names: &[String],
+    lock: &CargoLock,
+) -> Result<HashSet<CrateRef>> {
     let mut list = HashSet::new();
-    let mut values: Vec<&serde_json::Value> = Vec::new();
-    if !md.workspace_metadata.is_null() {
-        values.push(&md.workspace_metadata);
-    }
-    for pid in &md.workspace_members {
-        if let Some(p) = md.packages.iter().find(|p| &p.id == pid)
-            && !p.metadata.is_null()
-        {
-            values.push(&p.metadata);
-        }
-    }
-    for v in values {
-        let Some(crates) = v
-            .get("patch")
-            .and_then(|p| p.get("crates"))
-            .and_then(|c| c.as_array())
-        else {
-            continue;
-        };
-        for c in crates {
-            if let Some(n) = c.as_str() {
-                list.insert(resolve_crate(lock, n)?);
-            }
-        }
+    for name in patch_crate_names {
+        list.insert(resolve_crate(lock, name)?);
     }
     Ok(list)
 }
 
-pub fn run() -> anyhow::Result<()> {
-    let args = {
-        let mut args = Cli::parse();
-        if let Some(idx) = args.crates.iter().position(|c| c == "patch-crate") {
-            args.crates.remove(idx);
-        }
-        args
-    };
+pub fn run_at(ws_hint: &Path, cli: Cli) -> Result<()> {
+    let ws = manifest::discover(ws_hint)?;
+    let lock = load_lock(&ws.root)?;
 
-    let md = load_metadata()?;
-    let ws_root = md.workspace_root.as_std_path().to_path_buf();
-    let lock = load_lock(&ws_root)?;
+    let patches_folder = patches_folder(&ws.root);
+    let patch_target_folder = patch_target_folder(&ws.root);
+    let patch_target_tmp_folder = patch_target_tmp_folder(&ws.root);
 
-    let patches_folder = patches_folder(&md);
-    let patch_target_folder = patch_target_folder(&md);
-    let patch_target_tmp_folder = patch_target_tmp_folder(&md);
-
-    if !args.crates.is_empty() {
+    if !cli.crates.is_empty() {
         info!("starting patch creation.");
         if !patches_folder.exists() {
             fs::create_dir_all(&patches_folder)?;
         }
-        for n in args.crates.iter() {
+        for n in cli.crates.iter() {
             info!("crate: {}, starting patch creation.", n);
             let cr = resolve_crate(&lock, n)?;
-            let src = find_crate_src(&ws_root, &cr)?;
+            let src = find_crate_src(&ws.root, &cr)?;
             let patched_crate_path = patch_target_folder.join(cr.slug());
 
             let original_crate_path = copy_crate(&src, &patch_target_tmp_folder, true)?;
@@ -313,11 +277,11 @@ pub fn run() -> anyhow::Result<()> {
     } else {
         info!("applying patch");
 
-        let mut crates_to_patch = collect_patch_list(&md, &lock)?;
+        let mut crates_to_patch = resolve_patch_list(&ws.patch_crates, &lock)?;
 
-        if args.force {
+        if cli.force {
             info!("Cleaning up patch folder.");
-            clean_patch_folder(&md)?;
+            clean_patch_folder(&ws.root)?;
         }
 
         if patches_folder.exists() {
@@ -346,8 +310,8 @@ pub fn run() -> anyhow::Result<()> {
                         }
                         let target = patch_target_folder.join(cr.slug());
                         if !target.exists() {
-                            let src = find_crate_src(&ws_root, &cr)?;
-                            copy_crate(&src, &patch_target_folder, args.force)?;
+                            let src = find_crate_src(&ws.root, &cr)?;
+                            copy_crate(&src, &patch_target_folder, cli.force)?;
                             info!("crate: {}, applying patch started.", pkg_name);
                             git::init(&target)?;
                             git::apply(&target, &patch_file)?;
@@ -368,13 +332,22 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         for cr in crates_to_patch {
-            let src = find_crate_src(&ws_root, &cr)?;
-            copy_crate(&src, &patch_target_folder, args.force)?;
+            let src = find_crate_src(&ws.root, &cr)?;
+            copy_crate(&src, &patch_target_folder, cli.force)?;
         }
     }
 
     info!("Done");
     Ok(())
+}
+
+pub fn run() -> Result<()> {
+    let mut cli = Cli::parse();
+    if let Some(idx) = cli.crates.iter().position(|c| c == "patch-crate") {
+        cli.crates.remove(idx);
+    }
+    let cwd = std::env::current_dir()?;
+    run_at(&cwd, cli)
 }
 
 mod log {
