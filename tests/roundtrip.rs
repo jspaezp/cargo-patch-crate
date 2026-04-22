@@ -54,6 +54,11 @@ fn end_to_end_cargo_run_prints_patched_string() {
     let out = std::process::Command::new("cargo")
         .current_dir(&dir)
         .args(["run", "--quiet"])
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .output()
         .expect("cargo run");
     let stdout = String::from_utf8_lossy(&out.stdout);
