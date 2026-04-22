@@ -2,3 +2,4 @@
 Cargo.lock
 !tests/fixtures/*/Cargo.lock
 tests/fixtures/*/target/
+docs/superpowers/
