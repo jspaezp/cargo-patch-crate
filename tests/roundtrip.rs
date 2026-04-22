@@ -13,7 +13,7 @@ fn bootstrap_applies_patch_to_filesystem() {
         let p = entry.expect("dirent").path();
         if p.file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |n| n.starts_with("home-"))
+            .is_some_and(|n| n.starts_with("home-"))
         {
             home_dir = Some(p);
             break;
