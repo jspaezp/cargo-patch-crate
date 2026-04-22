@@ -1,6 +1,10 @@
 ## Patch-Crate
 
-[![](https://img.shields.io/crates/v/patch-crate.svg)](https://crates.io/crates/patch-crate)
+Fork of [mokeyish/cargo-patch-crate](https://github.com/mokeyish/cargo-patch-crate).
+Differences from upstream:
+
+- Uses `cargo_metadata` instead of the full `cargo` crate. Faster builds, smaller binary.
+- Tolerates `[patch.crates-io]` entries that point to a missing `target/patch/` path on first run.
 
 patch-crate lets rust app developer instantly make and keep fixes to rust crate dependencies.
 It's a vital band-aid for those of us living on the bleeding edge.
@@ -24,7 +28,7 @@ Checkout our example at [here](https://github.com/mokeyish/cargo-patch-crate-exa
 1. Install command `patch-crate`
 
    ```sh
-   cargo install patch-crate
+   cargo install --git https://github.com/jspaezp/cargo-patch-crate
    ```
 
 2. Add broken crate in your Cargo.toml
@@ -69,9 +73,9 @@ Checkout our example at [here](https://github.com/mokeyish/cargo-patch-crate-exa
    ```
 
    To make it work, add the patch-crate library to the build-dependencies
-   
+
    ```toml
-   patch-crate = "0.1"
+   patch-crate = { git = "https://github.com/jspaezp/cargo-patch-crate" }
    ```
 
 ## Command explanation
