@@ -50,20 +50,10 @@
 //! git commit -m "fix broken-serde in serde"
 //! ```
 
-use anyhow::{anyhow, Ok, Result};
-use cargo::{
-    core::{
-        package::{Package, PackageSet},
-        registry::PackageRegistry,
-        resolver::{features::CliFeatures, HasDevUnits},
-        Resolve, Workspace,
-    },
-    ops::{get_resolved_packages, load_pkg_lockfile, resolve_with_previous},
-    sources::SourceConfigMap,
-    util::{cache_lock::CacheLockMode, important_paths::find_root_manifest_for_wd, GlobalContext},
-};
+use anyhow::{Ok, Result, anyhow};
+use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use clap::Parser;
-use fs_extra::dir::{copy, CopyOptions};
+use fs_extra::dir::{CopyOptions, copy};
 use log::*;
 use std::{
     collections::HashSet,
@@ -82,100 +72,114 @@ struct Cli {
     force: bool,
 }
 
-trait PackageExt {
-    fn slug(&self) -> Result<&str>;
-    fn patch_target_path(&self, workspace: &Workspace<'_>) -> Result<PathBuf>;
+fn patches_folder(md: &Metadata) -> PathBuf {
+    md.workspace_root.as_std_path().join("patches")
 }
 
-impl PackageExt for Package {
-    fn slug(&self) -> Result<&str> {
-        if let Some(name) = self.root().file_name().and_then(|s| s.to_str()) {
-            Ok(name)
-        } else {
-            Err(anyhow!("Dependency Folder does not have a name"))
-        }
-    }
-
-    fn patch_target_path(&self, workspace: &Workspace<'_>) -> Result<PathBuf> {
-        let slug = self.slug()?;
-        let patch_target_path = workspace.patch_target_folder().join(slug);
-        Ok(patch_target_path)
-    }
+fn patch_target_folder(md: &Metadata) -> PathBuf {
+    md.workspace_root.as_std_path().join("target/patch")
 }
 
-trait WorkspaceExt {
-    fn patches_folder(&self) -> PathBuf;
-    fn patch_target_folder(&self) -> PathBuf;
-    fn patch_target_tmp_folder(&self) -> PathBuf;
-    fn clean_patch_folder(&self) -> Result<()>;
+fn patch_target_tmp_folder(md: &Metadata) -> PathBuf {
+    md.workspace_root.as_std_path().join("target/patch-tmp")
 }
 
-impl WorkspaceExt for Workspace<'_> {
-    fn patches_folder(&self) -> PathBuf {
-        self.root().join("patches/")
+fn clean_patch_folder(md: &Metadata) -> Result<()> {
+    let p = patch_target_folder(md);
+    if p.exists() {
+        fs::remove_dir_all(p)?;
     }
-    fn patch_target_folder(&self) -> PathBuf {
-        self.root().join("target/patch/")
-    }
-    fn patch_target_tmp_folder(&self) -> PathBuf {
-        self.root().join("target/patch-tmp/")
-    }
-
-    fn clean_patch_folder(&self) -> Result<()> {
-        let path = self.patch_target_folder();
-        if path.exists() {
-            fs::remove_dir_all(self.patch_target_folder())?;
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
-fn resolve_ws<'a>(ws: &Workspace<'a>) -> Result<(PackageSet<'a>, Resolve)> {
-    let mut registry =
-        PackageRegistry::new_with_source_config(ws.gctx(), SourceConfigMap::new(ws.gctx())?)?;
-    registry.lock_patches();
-    let resolve = {
-        let prev = load_pkg_lockfile(ws)?;
-        let resolve: Resolve = resolve_with_previous(
-            &mut registry,
-            ws,
-            &CliFeatures::new_all(true),
-            HasDevUnits::No,
-            prev.as_ref(),
-            None,
-            &[],
-            false,
-        )?;
-        resolve
+fn pkg_root(pkg: &Package) -> &Path {
+    pkg.manifest_path
+        .parent()
+        .expect("manifest_path has parent")
+        .as_std_path()
+}
+
+fn pkg_slug(pkg: &Package) -> Result<&str> {
+    pkg_root(pkg)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("Dependency Folder does not have a name"))
+}
+
+fn patch_target_path(pkg: &Package, md: &Metadata) -> Result<PathBuf> {
+    Ok(patch_target_folder(md).join(pkg_slug(pkg)?))
+}
+
+fn query<'a>(md: &'a Metadata, q: &str) -> Result<&'a Package> {
+    let (name, ver) = match q.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (q, None),
     };
-    let packages = get_resolved_packages(&resolve, registry)?;
-    Ok((packages, resolve))
+    let matches: Vec<&Package> = md
+        .packages
+        .iter()
+        .filter(|p| p.name == name && ver.is_none_or(|v| p.version.to_string() == v))
+        .collect();
+    match matches.len() {
+        0 => Err(anyhow!("package `{}` not found", q)),
+        1 => Ok(matches[0]),
+        _ => Err(anyhow!(
+            "multiple versions of `{}` found; specify with name@version",
+            name
+        )),
+    }
 }
 
-fn copy_package(pkg: &Package, patch_target_folder: &Path, overwrite: bool) -> Result<PathBuf> {
-    fs::create_dir_all(patch_target_folder)?;
-    let options = CopyOptions::new();
-    let patch_target_path = patch_target_folder.join(pkg.slug()?);
-    if patch_target_path.exists() {
+fn copy_package(pkg: &Package, dst_folder: &Path, overwrite: bool) -> Result<PathBuf> {
+    fs::create_dir_all(dst_folder)?;
+    let dst = dst_folder.join(pkg_slug(pkg)?);
+    if dst.exists() {
         if overwrite {
-            info!("crate: {}, copy to {:?}", pkg.name(), &patch_target_folder);
-            fs::remove_dir_all(&patch_target_path)?;
+            info!("crate: {}, copy to {:?}", pkg.name, dst_folder);
+            fs::remove_dir_all(&dst)?;
         } else {
-            info!(
-                "crate: {}, skip, {:?} already exists.",
-                pkg.name(),
-                &patch_target_path
-            );
-            return Ok(patch_target_path);
+            info!("crate: {}, skip, {:?} already exists.", pkg.name, &dst);
+            return Ok(dst);
         }
     }
-    let _ = copy(pkg.root(), patch_target_folder, &options)?;
-    Ok(patch_target_path)
+    copy(pkg_root(pkg), dst_folder, &CopyOptions::new())?;
+    Ok(dst)
 }
 
-fn find_cargo_toml(path: &Path) -> Result<PathBuf> {
-    let path = fs::canonicalize(path)?;
-    find_root_manifest_for_wd(&path)
+fn load_metadata() -> Result<Metadata> {
+    MetadataCommand::new()
+        .exec()
+        .map_err(|e| anyhow!("cargo metadata failed: {}", e))
+}
+
+fn collect_patch_list(md: &Metadata) -> Result<HashSet<PackageId>> {
+    let mut list: HashSet<PackageId> = HashSet::new();
+    let mut values: Vec<&serde_json::Value> = Vec::new();
+    if !md.workspace_metadata.is_null() {
+        values.push(&md.workspace_metadata);
+    }
+    for pid in &md.workspace_members {
+        if let Some(p) = md.packages.iter().find(|p| &p.id == pid)
+            && !p.metadata.is_null()
+        {
+            values.push(&p.metadata);
+        }
+    }
+    for v in values {
+        let Some(crates) = v
+            .get("patch")
+            .and_then(|p| p.get("crates"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for c in crates {
+            if let Some(n) = c.as_str() {
+                list.insert(query(md, n)?.id.clone());
+            }
+        }
+    }
+    Ok(list)
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -187,19 +191,11 @@ pub fn run() -> anyhow::Result<()> {
         args
     };
 
-    let gctx = GlobalContext::default()?;
-    let _lock = gctx.acquire_package_cache_lock(CacheLockMode::Shared)?;
+    let md = load_metadata()?;
 
-    let cargo_toml_path = find_cargo_toml(&PathBuf::from("."))?;
-
-    let workspace = Workspace::new(&cargo_toml_path, &gctx)?;
-
-    let patches_folder = workspace.patches_folder();
-
-    let patch_target_folder = workspace.patch_target_folder();
-    let patch_target_tmp_folder = workspace.patch_target_tmp_folder();
-
-    let (pkg_set, resolve) = resolve_ws(&workspace)?;
+    let patches_folder = patches_folder(&md);
+    let patch_target_folder = patch_target_folder(&md);
+    let patch_target_tmp_folder = patch_target_tmp_folder(&md);
 
     if !args.crates.is_empty() {
         info!("starting patch creation.");
@@ -207,21 +203,16 @@ pub fn run() -> anyhow::Result<()> {
             fs::create_dir_all(&patches_folder)?;
         }
         for n in args.crates.iter() {
-            // make patch
             info!("crate: {}, starting patch creation.", n);
-            let pkg_id = resolve.query(n)?;
-            let pkg = pkg_set.get_one(pkg_id)?;
-            let patched_crate_path = pkg.patch_target_path(&workspace)?;
+            let pkg = query(&md, n)?;
+            let patched_crate_path = patch_target_path(pkg, &md)?;
 
-            // clone the original crate to a temporary folder
             let original_crate_path = copy_package(pkg, &patch_target_tmp_folder, true)?;
             git::init(&original_crate_path)?;
 
             let original_crate_git_path = original_crate_path.join(".git");
             let patched_crate_git_path = patched_crate_path.join(".git");
 
-            // destroy the .git folder in the patched crate, and copy the .git folder from the original crate
-            // for diffing
             git::destroy(&patched_crate_path)?;
             copy(
                 &original_crate_git_path,
@@ -229,12 +220,8 @@ pub fn run() -> anyhow::Result<()> {
                 &CopyOptions::new().overwrite(true).copy_inside(true),
             )?;
 
-            let patch_file = patches_folder.join(format!(
-                "{}+{}.{}",
-                pkg_id.name(),
-                pkg_id.version(),
-                PATCH_EXT
-            ));
+            let patch_file =
+                patches_folder.join(format!("{}+{}.{}", pkg.name, pkg.version, PATCH_EXT));
             git::create_patch(&patched_crate_path, &patch_file)?;
             fs::remove_dir_all(&patch_target_tmp_folder)?;
 
@@ -242,36 +229,17 @@ pub fn run() -> anyhow::Result<()> {
             info!("crate: {}, create patch successfully, {:?}", n, &patch_file);
         }
     } else {
-        // apply patch
         info!("applying patch");
 
-        let custom_metadata = workspace.custom_metadata().into_iter().chain(
-            workspace
-                .members()
-                .flat_map(|member| member.manifest().custom_metadata()),
-        );
-
-        let mut crates_to_patch = custom_metadata
-            .flat_map(|m| {
-                m.as_table()
-                    .and_then(|table| table.get("patch"))
-                    .into_iter()
-                    .flat_map(|patch| patch.as_table())
-                    .flat_map(|patch| patch.get("crates"))
-                    .filter_map(|crates| crates.as_array())
-            })
-            .flatten()
-            .flat_map(|s| s.as_str())
-            .map(|n| resolve.query(n).and_then(|id| pkg_set.get_one(id)))
-            .collect::<Result<HashSet<_>>>()?;
+        let mut crates_to_patch = collect_patch_list(&md)?;
 
         if args.force {
             info!("Cleaning up patch folder.");
-            workspace.clean_patch_folder()?;
+            clean_patch_folder(&md)?;
         }
 
         if patches_folder.exists() {
-            for entry in fs::read_dir(patches_folder)? {
+            for entry in fs::read_dir(&patches_folder)? {
                 let entry = entry?;
                 if entry.metadata()?.is_file()
                     && entry.path().extension() == Some(OsStr::new(PATCH_EXT))
@@ -283,9 +251,8 @@ pub fn run() -> anyhow::Result<()> {
                         .ok_or(anyhow!("Patch file does not have a name"))?;
 
                     if let Some((pkg_name, version)) = filename.split_once('+') {
-                        let pkg_id = resolve.query(format!("{}@{}", pkg_name, version).as_str())?;
-                        let pkg = pkg_set.get_one(pkg_id)?;
-                        if !crates_to_patch.contains(&pkg) {
+                        let pkg = query(&md, &format!("{}@{}", pkg_name, version))?;
+                        if !crates_to_patch.contains(&pkg.id) {
                             warn!(
                                 "crate: {}, {} is not in the [package.metadata.patch] or [workspace.metadata.patch] section of Cargo.toml. Did you forget to add it?",
                                 pkg_name, pkg_name
@@ -293,27 +260,32 @@ pub fn run() -> anyhow::Result<()> {
                             continue;
                         }
 
-                        let patch_target_path = pkg.patch_target_path(&workspace)?;
-                        if !patch_target_path.exists() {
+                        let target = patch_target_path(pkg, &md)?;
+                        if !target.exists() {
                             copy_package(pkg, &patch_target_folder, args.force)?;
                             info!("crate: {}, applying patch started.", pkg_name);
-                            git::init(&patch_target_path)?;
-                            git::apply(&patch_target_path, &patch_file)?;
-                            git::destroy(&patch_target_path)?;
+                            git::init(&target)?;
+                            git::apply(&target, &patch_file)?;
+                            git::destroy(&target)?;
                             info!(
                                 "crate: {}, successfully applied patch {:?}.",
                                 pkg_name, patch_file
                             );
                         } else {
-                            info!("crate: {}, skip applying patch, {:?} already exists. Did you forget to add `--force`?", pkg_name, patch_target_path);
+                            info!(
+                                "crate: {}, skip applying patch, {:?} already exists. Did you forget to add `--force`?",
+                                pkg_name, target
+                            );
                         }
-                        crates_to_patch.remove(pkg);
+                        crates_to_patch.remove(&pkg.id);
                     }
                 }
             }
         }
-        for pkg in crates_to_patch {
-            copy_package(pkg, &patch_target_folder, args.force)?;
+        for pid in crates_to_patch {
+            if let Some(pkg) = md.packages.iter().find(|p| p.id == pid) {
+                copy_package(pkg, &patch_target_folder, args.force)?;
+            }
         }
     }
 
@@ -385,7 +357,11 @@ mod git {
 
         let out = Command::new("git")
             .current_dir(repo_dir)
-            .args([OsStr::new("diff"), OsStr::new("--staged"), OsStr::new("--no-ext-diff")])
+            .args([
+                OsStr::new("diff"),
+                OsStr::new("--staged"),
+                OsStr::new("--no-ext-diff"),
+            ])
             .output()?;
 
         if out.status.success() {
