@@ -60,7 +60,6 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 mod manifest;
@@ -154,33 +153,21 @@ fn download_crate(ws_root: &Path, cr: &CrateRef) -> Result<PathBuf> {
         return Ok(dst);
     }
     let url = format!(
-        "https://crates.io/api/v1/crates/{}/{}/download",
+        "https://static.crates.io/crates/{0}/{0}-{1}.crate",
         cr.name, cr.version
     );
     info!("downloading {}", url);
-    let tar_path = cache.join(format!("{}.crate", cr.slug()));
-    // Clear any stale/partial .crate from a previous interrupted run.
-    let _ = fs::remove_file(&tar_path);
-    let status = Command::new("curl")
-        .args(["-fsSL", "-o"])
-        .arg(&tar_path)
-        .arg(&url)
-        .status()?;
-    if !status.success() {
-        let _ = fs::remove_file(&tar_path);
-        bail!("curl failed for {}", url);
-    }
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&tar_path)
-        .arg("-C")
-        .arg(&cache)
-        .status()?;
-    if !status.success() {
-        let _ = fs::remove_file(&tar_path);
-        bail!("tar failed for {:?} (file removed)", tar_path);
-    }
-    let _ = fs::remove_file(&tar_path);
+    let resp = ureq::get(&url)
+        .set(
+            "User-Agent",
+            "cargo-patch-crate (https://github.com/jspaezp/cargo-patch-crate)",
+        )
+        .call()
+        .map_err(|e| anyhow!("download failed for {}: {}", url, e))?;
+    let gz = flate2::read::GzDecoder::new(resp.into_reader());
+    tar::Archive::new(gz)
+        .unpack(&cache)
+        .map_err(|e| anyhow!("extract failed for {}: {}", url, e))?;
     if !dst.is_dir() {
         bail!("extracted archive did not produce {:?}", dst);
     }
