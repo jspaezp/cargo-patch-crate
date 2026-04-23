@@ -159,12 +159,15 @@ fn download_crate(ws_root: &Path, cr: &CrateRef) -> Result<PathBuf> {
     );
     info!("downloading {}", url);
     let tar_path = cache.join(format!("{}.crate", cr.slug()));
+    // Clear any stale/partial .crate from a previous interrupted run.
+    let _ = fs::remove_file(&tar_path);
     let status = Command::new("curl")
-        .args(["-sSL", "-o"])
+        .args(["-fsSL", "-o"])
         .arg(&tar_path)
         .arg(&url)
         .status()?;
     if !status.success() {
+        let _ = fs::remove_file(&tar_path);
         bail!("curl failed for {}", url);
     }
     let status = Command::new("tar")
@@ -174,7 +177,8 @@ fn download_crate(ws_root: &Path, cr: &CrateRef) -> Result<PathBuf> {
         .arg(&cache)
         .status()?;
     if !status.success() {
-        bail!("tar failed for {:?}", tar_path);
+        let _ = fs::remove_file(&tar_path);
+        bail!("tar failed for {:?} (file removed)", tar_path);
     }
     let _ = fs::remove_file(&tar_path);
     if !dst.is_dir() {
