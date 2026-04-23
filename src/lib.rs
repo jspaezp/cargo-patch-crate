@@ -1,54 +1,18 @@
+//! `patch-crate` lets you keep local fixes to a dependency's source,
+//! shared via a committed `.patch` file.
 //!
-//! patch-crate lets rust app developer instantly make and keep fixes to crate dependencies.
-//! It's a vital band-aid for those of us living on the bleeding edge.
-//!
-//! # Installation
-//!
-//! Simply run:
-//! ```sh
-//! cargo install patch-crate
-//! ```
-//!
-//! # Usage
-//!
-//! To patch dependency one has to add the following
-//! to `Cargo.toml`
-//!
-//! ```toml
-//! [package.metadata.patch]
-//! crates = ["serde"]
-//! ```
-//!
-//! It specifies which dependency to patch (in this case
-//! serde). Running:
+//! This is a fork of [mokeyish/cargo-patch-crate] maintained at
+//! [jspaezp/cargo-patch-crate]. Install with:
 //!
 //! ```sh
-//! cargo patch-crate
+//! cargo install --git https://github.com/jspaezp/cargo-patch-crate
 //! ```
 //!
-//! will download the sede package specified in the
-//! dpendency section to the `target/patch` folder.
+//! See the [README] for the worked example and command reference.
 //!
-//! Then override the dependency using
-//! `replace` like this
-//!
-//! ```toml
-//! [patch.crates-io]
-//! serde = { path = './target/patch/serde-1.0.110' }
-//! ```
-//!
-//! fix a bug in './target/patch/serde-1.0.110' directly.
-//!
-//! run following to create a `patches/serde+1.0.110.patch` file
-//! ```sh
-//! cargo patch-crate serde
-//! ```
-//!
-//! commit the patch file to share the fix with your team
-//! ```sh
-//! git add patches/serde+1.0.110.patch
-//! git commit -m "fix broken-serde in serde"
-//! ```
+//! [mokeyish/cargo-patch-crate]: https://github.com/mokeyish/cargo-patch-crate
+//! [jspaezp/cargo-patch-crate]: https://github.com/jspaezp/cargo-patch-crate
+//! [README]: https://github.com/jspaezp/cargo-patch-crate#readme
 
 use anyhow::{Ok, Result, anyhow, bail};
 use clap::Parser;
